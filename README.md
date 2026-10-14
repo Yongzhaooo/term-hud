@@ -27,33 +27,60 @@ Layout is density first: entries are paired into two-row columns (CPU over MEM, 
 
 With several Windows Terminal windows open, the full HUD goes on the largest one (ties go to the top-right one). Any other window whose selected tab is Claude Code shows its own Claude column.
 
+### Install
+
+Paste into PowerShell (Windows PowerShell or PowerShell 7, no admin needed):
+
+```powershell
+irm https://raw.githubusercontent.com/Yongzhaooo/term-hud/main/install.ps1 | iex
+```
+
+The script:
+
+1. installs PowerShell 7 with winget if it is missing;
+2. downloads `term-hud.ps1` to `%LOCALAPPDATA%\term-hud\app`, adds a Startup shortcut so it runs at login without a console window, and starts it;
+3. installs and sets up LibreHardwareMonitor (see below). This is the only step that shows a UAC prompt.
+
+Options and uninstall:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yongzhaooo/term-hud/main/install.ps1))) -NoLHM       # skip LibreHardwareMonitor
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yongzhaooo/term-hud/main/install.ps1))) -Uninstall   # remove term-hud and its LHM logon task
+```
+
+Run the install command again to update.
+
 ### Requirements
 
-| Needed for | Dependency |
-|---|---|
-| Everything | Windows 10 / 11, [Windows Terminal](https://aka.ms/terminal), [PowerShell 7](https://aka.ms/powershell) (64-bit) |
-| CPU temperature and package power | [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) running **as administrator** with its web server enabled on port 8085 (Options → Remote Web Server → Run) |
-| GPU column | NVIDIA driver (`nvidia-smi` on `PATH`) |
-| Claude column | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) logged in with the default `~/.claude` config |
+| Needed for | Dependency | Installed by the script |
+|---|---|---|
+| Everything | Windows 10 / 11 with winget, [Windows Terminal](https://aka.ms/terminal) | No, both ship with Windows 11 |
+| Everything | [PowerShell 7](https://aka.ms/powershell) | Yes |
+| CPU temperature and package power | [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor) (LHM) | Yes, unless `-NoLHM` |
+| GPU column | NVIDIA driver (`nvidia-smi`) | No |
+| Claude column | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) logged in with the default `~/.claude` config | No |
 
 Missing sources just show `--`; everything else keeps working.
 
-### Run
+### LibreHardwareMonitor
+
+Windows does not expose CPU temperature to normal programs, so term-hud reads it from LHM's local web server at `http://127.0.0.1:8085/data.json`. LHM needs **administrator rights** to read the sensors. Without it, temperature and power show `--`.
+
+The installer sets LHM up like this:
+
+- `winget install LibreHardwareMonitor.LibreHardwareMonitor`;
+- in `LibreHardwareMonitor.config` next to the exe: web server on, port 8085, start minimized, minimize and close to the tray;
+- a scheduled task `term-hud LibreHardwareMonitor` that starts LHM at logon with highest privileges, so there is no UAC prompt at every boot.
+
+To set it up by hand instead: install LHM, run it as administrator, turn on **Options → Remote Web Server → Run** (port 8085), and tick **Options → Run On Windows Startup**.
+
+### Run from source
 
 ```powershell
 git clone https://github.com/Yongzhaooo/term-hud.git
 cd term-hud
 pwsh -NoProfile -File .\term-hud.ps1          # runs in the foreground; only one instance at a time
 pwsh -NoProfile -File .\term-hud.ps1 -Test    # self-test of the pure logic
-```
-
-Start at login without a console window by adding a shortcut to the Startup folder:
-
-```powershell
-$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Startup'))\term-hud.lnk")
-$lnk.TargetPath = 'conhost.exe'
-$lnk.Arguments = "--headless `"$((Get-Command pwsh).Source)`" -NoProfile -File `"$PWD\term-hud.ps1`""
-$lnk.Save()
 ```
 
 ### Use
@@ -86,6 +113,7 @@ Measured on 2026-10-14 over 3 minutes of normal use, sampled once per second (15
 - In the full UI test, the HUD reappeared 732 ms after a title-bar drag ended and 1087 ms after a drag started from the HUD.
 
 ### Known issues
+
 - Dragging the terminal window can still feel a bit laggy.
 - Detecting which terminal window to attach to, and where its tabs end, is still not very reliable.
 - Windows only. It depends on Windows Terminal, PowerShell 7, Win32 / UI Automation, Windows performance counters, and optionally LibreHardwareMonitor and `nvidia-smi`. Cross-monitor DPI changes have not been tested on real hardware.
@@ -126,33 +154,60 @@ The product spec, in Chinese, is in [docs/product.md](docs/product.md).
 
 开着多个 Windows Terminal 窗口时，完整 HUD 显示在最大的那个上，面积相近时选最靠右上角的。其他窗口如果选中的是 Claude Code 标签，会单独显示自己的 Claude 列。
 
+### 安装
+
+在 PowerShell 里粘贴运行（Windows PowerShell 或 PowerShell 7 都行，不需要管理员）：
+
+```powershell
+irm https://raw.githubusercontent.com/Yongzhaooo/term-hud/main/install.ps1 | iex
+```
+
+脚本会做三件事：
+
+1. 没有 PowerShell 7 时用 winget 安装；
+2. 把 `term-hud.ps1` 下载到 `%LOCALAPPDATA%\term-hud\app`，在“启动”文件夹建快捷方式（登录后自动运行，不弹控制台窗口），并立即启动；
+3. 安装并配置 LibreHardwareMonitor（见下文）。只有这一步会弹一次 UAC。
+
+选项与卸载：
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yongzhaooo/term-hud/main/install.ps1))) -NoLHM       # 不装 LibreHardwareMonitor
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Yongzhaooo/term-hud/main/install.ps1))) -Uninstall   # 卸载 term-hud 及其 LHM 登录任务
+```
+
+更新：重新运行安装命令即可。
+
 ### 依赖
 
-| 用途 | 依赖 |
-|---|---|
-| 全部功能 | Windows 10 / 11、[Windows Terminal](https://aka.ms/terminal)、[PowerShell 7](https://aka.ms/powershell)（64 位） |
-| CPU 温度和封装功耗 | [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)，需**以管理员身份**运行并开启 8085 端口的 Web 服务（Options → Remote Web Server → Run） |
-| GPU 列 | NVIDIA 驱动（`PATH` 中有 `nvidia-smi`） |
-| Claude 列 | 已登录的 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)，使用默认的 `~/.claude` 配置 |
+| 用途 | 依赖 | 安装脚本是否代装 |
+|---|---|---|
+| 全部功能 | 带 winget 的 Windows 10 / 11、[Windows Terminal](https://aka.ms/terminal) | 否，Windows 11 自带 |
+| 全部功能 | [PowerShell 7](https://aka.ms/powershell) | 是 |
+| CPU 温度和封装功耗 | [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor)（LHM） | 是，除非加 `-NoLHM` |
+| GPU 列 | NVIDIA 驱动（`nvidia-smi`） | 否 |
+| Claude 列 | 已登录的 [Claude Code](https://docs.anthropic.com/en/docs/claude-code)，使用默认的 `~/.claude` 配置 | 否 |
 
 缺少某个数据源时，对应格子显示 `--`，其他条目照常工作。
 
-### 运行
+### LibreHardwareMonitor
+
+Windows 不向普通程序开放 CPU 温度，term-hud 通过 LHM 的本地 Web 服务 `http://127.0.0.1:8085/data.json` 读取。LHM 需要**管理员权限**才能读传感器；没有它时，温度和功耗显示 `--`。
+
+安装脚本对 LHM 的配置：
+
+- `winget install LibreHardwareMonitor.LibreHardwareMonitor`；
+- 修改 exe 旁的 `LibreHardwareMonitor.config`：开启 Web 服务、端口 8085、启动时最小化、最小化和关闭都缩到托盘；
+- 注册计划任务 `term-hud LibreHardwareMonitor`，登录时以最高权限启动 LHM，之后每次开机不再弹 UAC。
+
+也可以手动配置：安装 LHM，以管理员身份运行，开启 **Options → Remote Web Server → Run**（端口 8085），再勾选 **Options → Run On Windows Startup**。
+
+### 从源码运行
 
 ```powershell
 git clone https://github.com/Yongzhaooo/term-hud.git
 cd term-hud
 pwsh -NoProfile -File .\term-hud.ps1          # 前台运行，同时只允许一个实例
 pwsh -NoProfile -File .\term-hud.ps1 -Test    # 自检纯逻辑
-```
-
-开机自启、不弹控制台窗口：在“启动”文件夹里建一个快捷方式。
-
-```powershell
-$lnk = (New-Object -ComObject WScript.Shell).CreateShortcut("$([Environment]::GetFolderPath('Startup'))\term-hud.lnk")
-$lnk.TargetPath = 'conhost.exe'
-$lnk.Arguments = "--headless `"$((Get-Command pwsh).Source)`" -NoProfile -File `"$PWD\term-hud.ps1`""
-$lnk.Save()
 ```
 
 ### 操作
@@ -185,6 +240,7 @@ $lnk.Save()
 - 完整 UI 测试中，从标题栏拖动结束后 732 ms、从 HUD 上拖动结束后 1087 ms，HUD 重新出现。
 
 ### 已知问题
+
 - 拖动终端窗口时仍有些卡顿。
 - 自动识别该挂在哪个终端窗口、以及标签栏右边界的准确度还不够好。
 - 只支持 Windows：依赖 Windows Terminal、PowerShell 7、Win32 / UI Automation、Windows 性能计数器，可选依赖 LibreHardwareMonitor 和 `nvidia-smi`。跨显示器 DPI 切换还没在真机上测过。
