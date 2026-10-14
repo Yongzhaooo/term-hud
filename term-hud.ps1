@@ -3,6 +3,8 @@
 # Claude 额度来自本机 Claude Code 登录凭据对应的 /api/oauth/usage。
 param([switch]$Test)
 
+$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+
 $ClaudeTitle = '^[·✢✳✶✻✽◐◓◑◒]'  # Claude Code 写在标签标题开头的状态符号
 $ClaudeRed = 95                  # 额度达到该百分比时标红并显示重置时间
 $Zh = [Globalization.CultureInfo]::CurrentUICulture.Name -like 'zh*'
@@ -148,7 +150,7 @@ if ($Test) {
     if ($sp.W -ne 5) { throw "span should not widen: $($sp.W)" }
     $px = @(Get-ClawdPixels)
     if ($px.Count -ne 54 -or ($px | ForEach-Object { $_[0] } | Measure-Object -Maximum).Maximum -ne 16) { throw "Clawd pixels: $($px.Count)" }
-    'ok'; return
+    'OK (19 legacy checks)'; return
 }
 
 $mutex = [Threading.Mutex]::new($false, 'Local\term-hud')
@@ -166,14 +168,21 @@ Add-Type -Namespace W -Name U -MemberDefinition @'
 [DllImport("user32.dll")] public static extern bool SetWindowPos(IntPtr h, IntPtr after, int x, int y, int w, int ht, uint f);
 [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr v);
 [DllImport("user32.dll")] public static extern bool ReleaseCapture();
-[DllImport("user32.dll")] public static extern IntPtr SendMessage(IntPtr h, int m, IntPtr w, IntPtr l);
 [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, int m, IntPtr w, IntPtr l);
+[DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
+[DllImport("user32.dll")] static extern bool GetCursorPos(out POINT point);
+[DllImport("user32.dll")] static extern short GetAsyncKeyState(int key);
+[DllImport("user32.dll")] static extern uint SendInput(uint count, INPUT[] inputs, int size);
 [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, System.Text.StringBuilder s, int n);
 [DllImport("user32.dll")] public static extern IntPtr GetDC(IntPtr h);
 [DllImport("user32.dll")] public static extern int ReleaseDC(IntPtr h, IntPtr dc);
 [DllImport("gdi32.dll")] public static extern uint GetPixel(IntPtr dc, int x, int y);
 [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
 [DllImport("user32.dll")] public static extern IntPtr GetAncestor(IntPtr h, uint flags);
+[DllImport("user32.dll")] public static extern IntPtr GetWindow(IntPtr h, uint cmd);
+[DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr GetProp(IntPtr h, string name);
+[DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(IntPtr h, IntPtr process);
+[DllImport("user32.dll")] static extern bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info);
 [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out RECT r, int s);
 [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h, int a, out int v, int s);
 [DllImport("kernel32.dll")] static extern IntPtr CreateJobObject(IntPtr a, string n);
@@ -181,23 +190,70 @@ Add-Type -Namespace W -Name U -MemberDefinition @'
 [DllImport("kernel32.dll")] static extern bool AssignProcessToJobObject(IntPtr j, IntPtr p);
 public struct RECT { public int L, T, R, B; }
 public struct POINT { public int X, Y; }
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Sequential)]
+struct MOUSEINPUT { public int X, Y; public uint Data, Flags, Time; public UIntPtr Extra; }
+[System.Runtime.InteropServices.StructLayout(System.Runtime.InteropServices.LayoutKind.Explicit)]
+struct INPUT { [System.Runtime.InteropServices.FieldOffset(0)] public uint Type; [System.Runtime.InteropServices.FieldOffset(8)] public MOUSEINPUT Mouse; }
+struct GUITHREADINFO { public uint Size, Flags; public IntPtr Active, Focus, Capture, MenuOwner, MoveSize, Caret; public RECT CaretRect; }
 // 拖动或缩放 WT 时先隐藏浮窗：线程池每 100 毫秒读一次各 WT 的位置（只读 DWM 属性，不给 WT 发消息），
 // 变了就隐藏对应浮窗并记下时间；PowerShell 每秒的定时器在停稳后重新显示。放在 C# 里是因为高频调用 PowerShell 脚本块本身就很费 CPU。
 [DllImport("user32.dll")] static extern bool ShowWindowAsync(IntPtr h, int cmd);
 static readonly System.Collections.Generic.Dictionary<IntPtr, IntPtr> watch = new System.Collections.Generic.Dictionary<IntPtr, IntPtr>();  // WT -> 浮窗
 static readonly System.Collections.Generic.Dictionary<IntPtr, RECT> lastRect = new System.Collections.Generic.Dictionary<IntPtr, RECT>();
 static readonly System.Collections.Generic.Dictionary<IntPtr, long> movedAt = new System.Collections.Generic.Dictionary<IntPtr, long>();
+static readonly System.Collections.Generic.HashSet<IntPtr> settling = new System.Collections.Generic.HashSet<IntPtr>();
+static readonly System.Collections.Generic.HashSet<IntPtr> pinned = new System.Collections.Generic.HashSet<IntPtr>();
+public static readonly System.Threading.AutoResetEvent Changed = new System.Threading.AutoResetEvent(false);
 static System.Threading.Timer moveTimer;
-public static void Watch(IntPtr wt, IntPtr hud) { lock (watch) { watch[wt] = hud; if (moveTimer == null) moveTimer = new System.Threading.Timer(_ => CheckMoves(), null, 100, 100); } }
-public static void Unwatch(IntPtr wt) { lock (watch) { watch.Remove(wt); lastRect.Remove(wt); movedAt.Remove(wt); } }
-public static bool Moving(IntPtr wt) { lock (watch) { long t; return movedAt.TryGetValue(wt, out t) && Environment.TickCount64 - t < 500; } }
+public static void Watch(IntPtr wt, IntPtr hud, bool pin) { lock (watch) {
+    if (!watch.ContainsKey(wt)) { movedAt[wt] = Environment.TickCount64; settling.Add(wt); Changed.Set(); }
+    watch[wt] = hud; if (pin) pinned.Add(wt); else pinned.Remove(wt);
+    if (moveTimer == null) moveTimer = new System.Threading.Timer(_ => CheckMoves(), null, 100, 100);
+} }
+public static void Unwatch(IntPtr wt) { lock (watch) { watch.Remove(wt); lastRect.Remove(wt); movedAt.Remove(wt); settling.Remove(wt); pinned.Remove(wt); } }
+public static bool InMoveSize(IntPtr wt) {
+    var info = new GUITHREADINFO { Size = (uint)System.Runtime.InteropServices.Marshal.SizeOf<GUITHREADINFO>() };
+    uint thread = GetWindowThreadProcessId(wt, IntPtr.Zero);
+    return thread != 0 && GetGUIThreadInfo(thread, ref info) && info.MoveSize == wt && (info.Flags & 2) != 0;
+}
+public static bool Moving(IntPtr wt) { if (InMoveSize(wt)) return true; lock (watch) { long t; return movedAt.TryGetValue(wt, out t) && Environment.TickCount64 - t < 500; } }
+public static void Above(IntPtr wt, IntPtr hud, bool pin) {
+    IntPtr after = pin ? new IntPtr(-1) : GetWindow(wt, 3); // GW_HWNDPREV: insert immediately above WT without an owner/input-queue link.
+    if (after != hud) SetWindowPos(hud, after, 0, 0, 0, 0, 0x10 | 0x1 | 0x2);
+}
+public static void BeginDrag(IntPtr wt, IntPtr hud) {
+    ReleaseCapture();
+    lock (watch) { movedAt[wt] = Environment.TickCount64; settling.Add(wt); }
+    ShowWindow(hud, 0);
+    POINT point;
+    // PostMessage cannot update another input queue's button state; hand the held press to WT's native hit testing.
+    if (GetAsyncKeyState(1) >= 0 || !GetCursorPos(out point) || GetAncestor(WindowFromPoint(point), 2) != wt) return;
+    var inputs = new[] { new INPUT { Mouse = new MOUSEINPUT { Flags = 4 } }, new INPUT { Mouse = new MOUSEINPUT { Flags = 2 } } };
+    SendInput(2, inputs, System.Runtime.InteropServices.Marshal.SizeOf<INPUT>());
+}
 static void CheckMoves() {
+    System.Collections.Generic.KeyValuePair<IntPtr, IntPtr>[] entries;
     lock (watch) {
-        foreach (var p in watch) {
-            RECT r; if (DwmGetWindowAttribute(p.Key, 9, out r, 16) != 0) continue;
+        entries = new System.Collections.Generic.KeyValuePair<IntPtr, IntPtr>[watch.Count];
+        ((System.Collections.Generic.ICollection<System.Collections.Generic.KeyValuePair<IntPtr, IntPtr>>)watch).CopyTo(entries, 0);
+    }
+    foreach (var p in entries) {
+        bool absent = !IsWindowVisible(p.Key) || IsIconic(p.Key);
+        RECT r = default; if (!absent && DwmGetWindowAttribute(p.Key, 9, out r, 16) != 0) continue;
+        bool dragging = !absent && InMoveSize(p.Key), hide = false;
+        // Never hold the state lock across window-system calls: the UI thread also reads this state.
+        lock (watch) {
+            IntPtr current; if (!watch.TryGetValue(p.Key, out current) || current != p.Value) continue;
+            if (absent) { hide = !pinned.Contains(p.Key); }
+            else {
             RECT o; bool had = lastRect.TryGetValue(p.Key, out o); lastRect[p.Key] = r;
-            if (had && (o.L != r.L || o.T != r.T || o.R != r.R || o.B != r.B)) { movedAt[p.Key] = Environment.TickCount64; ShowWindowAsync(p.Value, 0); }  // SW_HIDE
+            if (dragging || (had && (o.L != r.L || o.T != r.T || o.R != r.R || o.B != r.B))) {
+                movedAt[p.Key] = Environment.TickCount64; settling.Add(p.Key);
+                hide = true;
+            } else if (settling.Contains(p.Key) && Environment.TickCount64 - movedAt[p.Key] >= 500) { settling.Remove(p.Key); Changed.Set(); }
+            }
         }
+        if (hide && IsWindowVisible(p.Value)) ShowWindowAsync(p.Value, 0);
     }
 }
 // 子进程随本进程退出（含被强制结束），否则 nvidia-smi -lms 会成为孤儿常驻
@@ -234,7 +290,8 @@ if (Get-Command nvidia-smi -ErrorAction SilentlyContinue) {
 
 # 异步请求：每次 tick 只取已完成的结果，不阻塞界面
 $http = [Net.Http.HttpClient]@{ Timeout = [TimeSpan]::FromSeconds(10) }
-$http.DefaultRequestHeaders.Add('anthropic-beta', 'oauth-2025-04-20')
+$claudeHttp = [Net.Http.HttpClient]@{ Timeout = [TimeSpan]::FromSeconds(10) }
+$claudeHttp.DefaultRequestHeaders.Add('anthropic-beta', 'oauth-2025-04-20')
 $script:async = @{}
 # -Keep：失败时保留上次的值，并把下次请求的间隔翻倍（最长 30 分钟），成功后恢复；用于有限流的接口
 function Update-Async($name, $everySec, [scriptblock]$start, [switch]$Keep) {
@@ -254,75 +311,92 @@ function Update-Async($name, $everySec, [scriptblock]$start, [switch]$Keep) {
 $lhm = { $http.GetStringAsync('http://127.0.0.1:8085/data.json') }
 $claude = {
     # 只读默认 ~/.claude 的账户，用户已确认够用
-    $tok = (Get-Content (Join-Path $HOME '.claude\.credentials.json') -Raw | ConvertFrom-Json).claudeAiOauth.accessToken
-    $http.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $tok)
-    $http.GetStringAsync('https://api.anthropic.com/api/oauth/usage')
+    $tok = (Get-Content (Join-Path $HOME '.claude\.credentials.json') -Raw -Encoding utf8 | ConvertFrom-Json).claudeAiOauth.accessToken
+    $claudeHttp.DefaultRequestHeaders.Authorization = [Net.Http.Headers.AuthenticationHeaderValue]::new('Bearer', $tok)
+    $claudeHttp.GetStringAsync('https://api.anthropic.com/api/oauth/usage')
 }
 # 额度接口有限流（429）：每 5 分钟查一次；成功结果存盘，重启后先用缓存，未到间隔不重复请求
 $ClaudeEvery = 300
 $usageCache = Join-Path $env:LOCALAPPDATA 'term-hud\usage.json'
-if (Test-Path $usageCache) { $script:async['claude'] = @{ At = (Get-Item $usageCache).LastWriteTime; Wait = $ClaudeEvery; Value = (Get-Content $usageCache -Raw) } }
+if (Test-Path $usageCache) { $script:async['claude'] = @{ At = (Get-Item $usageCache).LastWriteTime; Wait = $ClaudeEvery; Value = (Get-Content $usageCache -Raw -Encoding utf8) } }
 
 # ---------- 设置 ----------
 $names = [ordered]@{ cpu = 'CPU'; gpu = 'GPU'; mem = (L '内存' 'Memory'); disk = (L '磁盘' 'Disk'); net = (L '网络' 'Network'); claude = (L 'Claude 额度' 'Claude usage') }
 $cfgPath = Join-Path $env:APPDATA 'term-hud\settings.json'
-$cfg = try { Get-Content $cfgPath -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+$cfg = try { Get-Content $cfgPath -Raw -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json } catch { $null }
 $script:show  = if ($cfg.show) { @($cfg.show) } else { @($names.Keys) }
 $script:pickD = @($cfg.disks | Where-Object { $_ -and $disks.Contains($_) })  # 空 = 全部磁盘
 $script:pinned = [bool]$cfg.pinned                                  # 始终显示：置顶，不随 WT 遮挡或最小化隐藏
 $script:pickN = @($cfg.nics | Where-Object { $_ -and $nics.Contains($_) })    # 空 = 自动取流量最大的网卡
 function Save-Settings {
     [void](New-Item -ItemType Directory -Force (Split-Path $cfgPath))
-    @{ show = $script:show; disks = $script:pickD; nics = $script:pickN; pinned = $script:pinned } | ConvertTo-Json | Set-Content $cfgPath
+    @{ show = $script:show; disks = $script:pickD; nics = $script:pickN; pinned = $script:pinned } | ConvertTo-Json | Set-Content $cfgPath -Encoding utf8
 }
 
 # ---------- 窗口 ----------
 $WtClass = 'CASCADIA_HOSTING_WINDOW_CLASS'
+function Get-WtWindow($hw) {
+    $r = [W.U+RECT]::new()
+    if ([W.U]::DwmGetWindowAttribute($hw, 9, [ref]$r, 16) -ne 0) { return }
+    $sb = [Text.StringBuilder]::new(256); [void][W.U]::GetWindowText($hw, $sb, 256)
+    $dpi = [W.U]::GetDpiForWindow($hw)
+    $title = $sb.ToString() -replace '^[·✢✳✶✻✽◐◓◑◒]', '*'
+    $shape = "$($r.R - $r.L),$($r.B - $r.T),$dpi|$title"
+    [pscustomobject]@{ H = $hw; L = $r.L; T = $r.T; R = $r.R; B = $r.B; Dpi = $dpi; Shape = $shape; Sig = "$($r.L),$($r.T)|$shape" }
+}
 function Get-WtWindows {
     $hw = [IntPtr]::Zero
     while (($hw = [W.U]::FindWindowEx([IntPtr]::Zero, $hw, $WtClass, [NullString]::Value)) -ne [IntPtr]::Zero) {
+        if ([W.U]::GetProp($hw, "term-hud-ci") -ne [IntPtr]::Zero) { continue }  # 专用 CI 窗口由隔离的测试 HUD 接管。
         $cloaked = 0; [void][W.U]::DwmGetWindowAttribute($hw, 14, [ref]$cloaked, 4)  # 其他虚拟桌面上的窗口是 cloaked
         if (-not [W.U]::IsWindowVisible($hw) -or [W.U]::IsIconic($hw) -or $cloaked) { continue }
-        $r = [W.U+RECT]::new(); [void][W.U]::DwmGetWindowAttribute($hw, 9, [ref]$r, 16)  # 可见边框，不含阴影
-        $sb = [Text.StringBuilder]::new(256); [void][W.U]::GetWindowText($hw, $sb, 256)
-        [pscustomobject]@{ H = $hw; L = $r.L; T = $r.T; R = $r.R; B = $r.B; Sig = "$($r.L),$($r.T),$($r.R),$($r.B)|" + ($sb.ToString() -replace $ClaudeTitle, '*') }  # Claude 状态符号会不停变，只保留“是 Claude”
+        Get-WtWindow $hw
     }
 }
+function Test-TabSnapshot($w, $tabs) { $tabs -and $tabs.Shape -eq $w.Shape -and $tabs.Bottom -gt 0 -and $tabs.Bottom -le 60 * $w.Dpi / 96 }
 # ---------- 后台线程 ----------
 # UI Automation 是跨进程同步调用，WT 忙时会卡住调用线程；放在界面线程上曾导致 HUD 无响应被系统关闭。
 # 标签查询和会话文件扫描都在后台线程做，界面线程只读 $shared 里的最新结果。
-$shared = [hashtable]::Synchronized(@{ Wins = @(); Tabs = @{}; Sessions = @(); AcWindow = 0 })  # Wins：要查询的 WT 窗口；Tabs：按窗口句柄存标签信息
+$shared = [hashtable]::Synchronized(@{ Wins = @(); Tabs = @{}; Sessions = @(); AcWindow = 0; Stop = $false; Error = $null })
 $worker = {
-    param($shared, $readTail)
+    param($shared, $readTail, $readWindow, $claudeDir)
     Set-Item function:Read-SessionTail ([scriptblock]::Create($readTail))
+    Set-Item function:Get-WtWindow ([scriptblock]::Create($readWindow))
     Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
-    $A = [Windows.Automation.AutomationElement]; $CT = [Windows.Automation.ControlType]
+    $AutomationElement = [Windows.Automation.AutomationElement]; $CT = [Windows.Automation.ControlType]
     $tabCond = [Windows.Automation.OrCondition]::new(
-        [Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $CT::TabItem),
-        [Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $CT::Button),
-        [Windows.Automation.PropertyCondition]::new($A::ControlTypeProperty, $CT::SplitButton))
+        [Windows.Automation.PropertyCondition]::new($AutomationElement::ControlTypeProperty, $CT::TabItem),
+        [Windows.Automation.PropertyCondition]::new($AutomationElement::ControlTypeProperty, $CT::Button),
+        [Windows.Automation.PropertyCondition]::new($AutomationElement::ControlTypeProperty, $CT::SplitButton))
     $uia = @{}; $asked = @{}; $cache = @{}; $scanAt = [DateTime]::MinValue; $recent = @()
-    $projects = Join-Path $HOME '.claude\projects'
-    while ($true) {
+    $projects = Join-Path $claudeDir 'projects'
+    while (-not $shared.Stop) {
         try {
             $tabs = @{}
-            foreach ($w in @($shared.Wins)) {
+            foreach ($key in @($shared.Wins)) {
+                $w = Get-WtWindow ([IntPtr]$key)
+                if (-not $w) { continue }
+                if ([W.U]::IsIconic($w.H)) { if ($shared.Tabs[$key]) { $tabs[$key] = $shared.Tabs[$key] }; continue }
                 # WT 的标签是 XAML 控件，只能经 UI Automation 取得位置和选中状态
-                $old = $shared.Tabs[$w.Key]; $a = $asked[$w.Key]
-                if ($old -and ($w.Moving -or ($a.Sig -eq $w.Sig -and ([DateTime]::Now - $a.At).TotalSeconds -lt 10))) { $tabs[$w.Key] = $old; continue }
-                $asked[$w.Key] = @{ Sig = $w.Sig; At = [DateTime]::Now }
-                $info = @{ Right = 0; Selected = ''; Bottom = 0 }
+                $old = $shared.Tabs[$key]; $askedEntry = $asked[$key]
+                if ([W.U]::Moving($w.H)) { if ($old) { $tabs[$key] = $old }; continue }
+                if ($old -and $old.Shape -eq $w.Shape -and ([DateTime]::Now - $askedEntry.At).TotalSeconds -lt 10) { $tabs[$key] = $old; continue }
+                $info = @{ Right = 0; Selected = ''; Bottom = 0; Shape = $w.Shape }
                 try {
-                    if (-not $uia[$w.Key]) { $uia[$w.Key] = $A::FromHandle([IntPtr]$w.Key) }
-                    foreach ($e in $uia[$w.Key].FindAll('Descendants', $tabCond)) {
+                    if (-not $uia[$key]) { $uia[$key] = $AutomationElement::FromHandle($w.H) }
+                    foreach ($e in $uia[$key].FindAll('Descendants', $tabCond)) {
                         $b = $e.Current.BoundingRectangle
-                        if ($b.IsEmpty -or $b.Top -ge $w.Bottom) { continue }  # 排除终端滚动条等标题栏以下的按钮
-                        $info.Right = [math]::Max($info.Right, $b.Right)
-                        if ($e.Current.ControlType -eq $CT::TabItem) { $info.Bottom = [math]::Max($info.Bottom, $b.Bottom) }
+                        if ($b.IsEmpty -or $b.Top -ge $w.T + 40 * $w.Dpi / 96) { continue }
+                        # 最大化时窗口按钮进入 WT 的 UIA 树；它们不属于标签占用的宽度。
+                        if ($e.Current.ControlType -ne $CT::TabItem -and $b.Right -gt $w.R - 138 * $w.Dpi / 96) { continue }
+                        $info.Right = [math]::Max($info.Right, $b.Right - $w.L)
+                        if ($e.Current.ControlType -eq $CT::TabItem) { $info.Bottom = [math]::Max($info.Bottom, $b.Bottom - $w.T) }
                         if ($e.Current.ControlType -eq $CT::TabItem -and $e.GetCurrentPropertyValue([Windows.Automation.SelectionItemPattern]::IsSelectedProperty)) { $info.Selected = $e.Current.Name }
                     }
-                    $tabs[$w.Key] = $info
-                } catch { $uia.Remove($w.Key) }
+                    if ((Get-WtWindow $w.H).Sig -eq $w.Sig -and -not [W.U]::Moving($w.H)) {
+                        $tabs[$key] = $info; $asked[$key] = @{ At = [DateTime]::Now }
+                    }
+                } catch { $uia.Remove($key); $shared.Error = "UIA: $($_.Exception.Message)" }
             }
             $shared.Tabs = $tabs
             # 会话文件：每 10 秒用 .NET 枚举一次最近两天的会话（Get-ChildItem 遍历全部项目要几百毫秒）；
@@ -330,7 +404,7 @@ $worker = {
             if (([DateTime]::Now - $scanAt).TotalSeconds -ge 10) {
                 $scanAt = [DateTime]::Now
                 $recent = @(foreach ($d in [IO.Directory]::EnumerateDirectories($projects)) { foreach ($f in [IO.Directory]::EnumerateFiles($d, '*.jsonl')) { if ([IO.File]::GetLastWriteTime($f) -gt [DateTime]::Now.AddDays(-2)) { $f } } })
-                $shared.AcWindow = try { [int64](Get-Content (Join-Path $HOME '.claude\settings.json') -Raw | ConvertFrom-Json).autoCompactWindow } catch { 0 }
+                $shared.AcWindow = try { [int64](Get-Content (Join-Path $claudeDir 'settings.json') -Raw -Encoding utf8 -ErrorAction Stop | ConvertFrom-Json).autoCompactWindow } catch { 0 }
             }
             foreach ($f in $recent) {
                 $st = [IO.File]::GetLastWriteTimeUtc($f); $c = $cache[$f]
@@ -338,11 +412,13 @@ $worker = {
                 try { $n = Read-SessionTail $f $c; $n.Stamp = $st; $cache[$f] = $n } catch {}
             }
             $shared.Sessions = @($cache.Values | Where-Object { $_.Title -and $_.Used })
-        } catch {}
-        Start-Sleep -Seconds 2
+        } catch { $shared.Error = "Worker: $($_.Exception.Message)" }
+        [void][W.U]::Changed.WaitOne(2000)
     }
 }
-$bgWorker = [powershell]::Create(); [void]$bgWorker.AddScript($worker).AddArgument($shared).AddArgument(${function:Read-SessionTail}.ToString()); [void]$bgWorker.BeginInvoke()
+$bgWorker = [powershell]::Create()
+[void]$bgWorker.AddScript($worker).AddArgument($shared).AddArgument(${function:Read-SessionTail}.ToString()).AddArgument(${function:Get-WtWindow}.ToString()).AddArgument((Join-Path $HOME '.claude'))
+[void]$bgWorker.BeginInvoke()
 
 $flags = [Windows.Forms.TextFormatFlags]'NoPadding, SingleLine'
 $clawd = @(Get-ClawdPixels)
@@ -405,8 +481,8 @@ $mouse = { param($s, $e)
     $wt = $s.Tag.Wt
     if ($e.Button -eq 'Right') { $menu.Show([Windows.Forms.Cursor]::Position); return }
     if ($e.Button -ne 'Left') { return }
-    if ($e.Clicks -ge 2) { [void][W.U]::SendMessage($wt, 0x112, [IntPtr]$(if ([W.U]::IsZoomed($wt)) { 0xF120 } else { 0xF030 }), 0) }
-    else { [void][W.U]::ReleaseCapture(); [void][W.U]::PostMessage($wt, 0xA1, [IntPtr]2, 0) }  # WM_NCLBUTTONDOWN + HTCAPTION；Post 而不是 Send，否则界面线程要同步等到拖动结束
+    if ($e.Clicks -ge 2) { [void][W.U]::PostMessage($wt, 0x112, [IntPtr]$(if ([W.U]::IsZoomed($wt)) { 0xF120 } else { 0xF030 }), 0) }
+    else { [W.U]::BeginDrag($wt, $s.Tag.H) }
 }
 # 每个 WT 窗口一个浮窗：最大的显示全部条目，其余只在选中 Claude 标签时显示该标签的 Claude 列
 $huds = @{}
@@ -415,15 +491,15 @@ function New-Hud {
     $hh = $f.Handle
     [void][W.U]::SetWindowLongPtr($hh, -20, [IntPtr]([int64][W.U]::GetWindowLongPtr($hh, -20) -bor 0x80 -bor 0x08000000))  # 不进 Alt+Tab、不抢焦点
     $f.add_Paint($paint); $f.add_MouseDown($mouse)
-    $f.Tag = @{ Form = $f; H = $hh; Wt = [IntPtr]::Zero; Owner = [IntPtr]::Zero; Layout = @(); M = $null; Val = [Drawing.Color]::Gainsboro }
+    $f.Tag = @{ Form = $f; H = $hh; Wt = [IntPtr]::Zero; Pinned = $null; Layout = @(); Bounds = $null; Tabs = $null; M = $null; Val = [Drawing.Color]::Gainsboro }
     $f.Tag
 }
-function Hide-Hud($hud) { if ($hud.Shown) { [void][W.U]::SetWindowPos($hud.H, [IntPtr]::Zero, 0, 0, 0, 0, 0x80 -bor 0x10 -bor 0x4 -bor 0x1 -bor 0x2); $hud.Shown = $false } }
+function Hide-Hud($hud) { if ([W.U]::IsWindowVisible($hud.H)) { [void][W.U]::SetWindowPos($hud.H, [IntPtr]::Zero, 0, 0, 0, 0, 0x80 -bor 0x10 -bor 0x4 -bor 0x1 -bor 0x2) }; $hud.Shown = $false }
 # 标题栏被其他窗口盖住：浮窗左右两侧的点不属于这个 WT
 function Test-Covered($w, $left, $capLeft, $sc) {
     foreach ($x in ($left - [int](4 * $sc)), ($capLeft + [int](4 * $sc))) {
         $pt = [W.U+POINT]::new(); $pt.X = $x; $pt.Y = $w.T + [int](6 * $sc)
-        if ([W.U]::GetAncestor([W.U]::WindowFromPoint($pt), 2) -ne $w.H) { return $true }  # GA_ROOT
+        if ([W.U]::GetAncestor([W.U]::WindowFromPoint($pt), 3) -ne $w.H) { return $true }  # GA_ROOTOWNER：WT 的标题按钮也是独立的 owned window。
     }
     $false
 }
@@ -510,13 +586,13 @@ $script:ccAt = [DateTime]::MinValue; $script:cc = $null
 function Get-Usage {
     if (([DateTime]::Now - $script:ccAt).TotalSeconds -ge 30) {
         $script:ccAt = [DateTime]::Now
-        $script:cc = try { (Get-Content (Join-Path $HOME '.claude.json') -Raw | ConvertFrom-Json).cachedUsageUtilization } catch { $null }
+        $script:cc = try { (Get-Content (Join-Path $HOME '.claude.json') -Raw -Encoding utf8 | ConvertFrom-Json).cachedUsageUtilization } catch { $null }
     }
     $fresh = $script:cc -and ([DateTimeOffset]::Now.ToUnixTimeMilliseconds() - $script:cc.fetchedAtMs) -lt $ClaudeEvery * 1000
     $api = $script:async['claude']
     if ($fresh -and -not ($api.Value -and $api.At -gt [DateTimeOffset]::FromUnixTimeMilliseconds($script:cc.fetchedAtMs).LocalDateTime)) { return $script:cc.utilization }
     $raw = Update-Async 'claude' $ClaudeEvery $claude -Keep
-    if ($script:async['claude'].Ok) { $script:async['claude'].Ok = $false; try { [void](New-Item -ItemType Directory -Force (Split-Path $usageCache)); Set-Content $usageCache $raw } catch {} }
+    if ($script:async['claude'].Ok) { $script:async['claude'].Ok = $false; try { [void](New-Item -ItemType Directory -Force (Split-Path $usageCache)); Set-Content $usageCache $raw -Encoding utf8 } catch {} }
     if ($raw) { try { $raw | ConvertFrom-Json } catch { $null } } elseif ($script:cc) { $script:cc.utilization }
 }
 # 数据里的重置时间已过（缓存过期、尚未拿到新数据）时显示 N/A，不挂着旧数值
@@ -546,19 +622,12 @@ function Get-ClaudeItem($tabs) {
 
 # 把一组条目排进某个 WT 窗口标题栏的空白处
 function Show-Hud($hud, $w, $items) {
-    $hud.Wt = $w.H
-    # 默认挂到 WT 上，跟随其层级；置顶时解除挂靠，否则 WT 最小化会把浮窗一起隐藏
-    $own = if ($script:pinned) { [IntPtr]::Zero } else { $w.H }
-    if ($own -ne $hud.Owner) {
-        [void][W.U]::SetWindowLongPtr($hud.H, -8, $own); $hud.Owner = $own
-        [void][W.U]::SetWindowPos($hud.H, [IntPtr]$(if ($script:pinned) { -1 } else { -2 }), 0, 0, 0, 0, 0x10 -bor 0x1 -bor 0x2)  # HWND_TOPMOST / HWND_NOTOPMOST
-    }
-    if (-not $items) { Hide-Hud $hud; return }
-    $sc = [W.U]::GetDpiForWindow($w.H) / 96; $m = Get-Metrics $sc; $script:m = $m; $hud.M = $m
-    $ht = [int](40 * $sc)                   # WT 标签栏高度约 40 DIP
+    $hud.Wt = $w.H; $hud.Bounds = $null
+    $tabs = $shared.Tabs[[int64]$w.H]
+    if (-not $items -or -not (Test-TabSnapshot $w $tabs)) { Hide-Hud $hud; return }
+    $sc = $w.Dpi / 96; $m = Get-Metrics $sc; $script:m = $m; $hud.M = $m
     $capLeft = $w.R - [int](3 * 46 * $sc)  # 让出最小化/最大化/关闭三个按钮
-    $tabs = $shared.Tabs[[int64]$w.H]; if (-not $tabs) { $tabs = @{ Right = 0; Selected = ''; Bottom = 0 } }
-    $left = [math]::Max($w.L, $tabs.Right) + [int](8 * $sc)
+    $left = $w.L + $tabs.Right + [int](8 * $sc)
 
     if (-not $script:pinned -and (Test-Covered $w $left $capLeft $sc)) { Hide-Hud $hud; $hud.Sig = $null; return }
     # 背景取标题栏空白处的颜色，整块不透明才能接收右键
@@ -575,38 +644,71 @@ function Show-Hud($hud, $w, $items) {
     $hud.Layout = $kept
     # 高度贴合标签栏：以标签实际下沿为准，上下让开窗口顶边框和标签栏底部分隔线（各约 1 DIP）
     $inset = [int][math]::Ceiling($sc)
-    $barBottom = if ($tabs.Bottom -gt $w.T) { $tabs.Bottom } else { $w.T + $ht }
-    [void][W.U]::SetWindowPos($hud.H, [IntPtr]::Zero, $capLeft - $wd, $w.T + $inset, $wd, $barBottom - $w.T - 2 * $inset, 0x40 -bor 0x10 -bor 0x4)  # SHOWWINDOW|NOACTIVATE|NOZORDER
-    $hud.Shown = $true; [W.U]::Watch($w.H, $hud.H)
+    $hud.Bounds = @(($capLeft - $wd), ($w.T + $inset), $wd, ($tabs.Bottom - 2 * $inset))
+    $hud.Tabs = $tabs
     $hud.Form.Invalidate()
+}
+
+# 浮窗保持独立顶层窗口；只在同一份有效几何快照上显示，每次检查遮挡与层级。
+function Sync-Hud($hud, $w) {
+    if (-not $hud.Bounds -or -not (Test-TabSnapshot $w $hud.Tabs)) { Hide-Hud $hud; return }
+    $frozen = $script:pinned -and [W.U]::IsIconic($w.H)
+    if (-not $frozen -and ([W.U]::Moving($w.H) -or (Get-WtWindow $w.H).Sig -ne $w.Sig)) { Hide-Hud $hud; return }
+    $sc = $w.Dpi / 96
+    if (-not $script:pinned -and (Test-Covered $w ($w.L + $hud.Tabs.Right + [int](8 * $sc)) ($w.R - [int](138 * $sc)) $sc)) {
+        Hide-Hud $hud; $hud.Sig = $null; return
+    }
+    if ($hud.Pinned -ne $script:pinned) {
+        [void][W.U]::SetWindowPos($hud.H, [IntPtr]$(if ($script:pinned) { -1 } else { -2 }), 0, 0, 0, 0, 0x10 -bor 0x1 -bor 0x2)
+        $hud.Pinned = $script:pinned
+    }
+    [W.U]::Above($w.H, $hud.H, $script:pinned)
+    $b = $hud.Bounds
+    [void][W.U]::SetWindowPos($hud.H, [IntPtr]::Zero, $b[0], $b[1], $b[2], $b[3], 0x40 -bor 0x10 -bor 0x4)
+    $hud.Shown = $true
 }
 
 # 每秒跟随窗口位置（拖动中由 C# 侧隐藏，停稳 0.5 秒后在这里重新显示）；资源数据每 3 秒采一次。位置、标签、设置都没变且没有新数据时不重新排版
 $script:dataAt = [DateTime]::MinValue; $script:res = @()
-$timer = [Windows.Forms.Timer]@{ Interval = 1000 }
-$timer.add_Tick({ try {
+function Update-Huds { try {
     $wins = @(Get-WtWindows)
-    foreach ($w in $wins) { $w | Add-Member Moving ([W.U]::Moving($w.H)) }
+    foreach ($w in $wins) {
+        $key = [int64]$w.H
+        if (-not $huds[$key]) { $huds[$key] = New-Hud }
+        [W.U]::Watch($w.H, $huds[$key].H, $script:pinned)
+        $w | Add-Member Moving ([W.U]::Moving($w.H))
+    }
     $target = Select-Target $wins
     if ($target) { $script:lastTarget = $target } elseif ($script:pinned -and $script:lastTarget) { $target = $script:lastTarget; $wins = @($target) }  # 置顶时 WT 最小化也留在原处
-    $shared.Wins = @($wins | ForEach-Object { @{ Key = [int64]$_.H; Sig = $_.Sig; Moving = $_.Moving; Bottom = $_.T + [int](40 * [W.U]::GetDpiForWindow($_.H) / 96) } })
+    $shared.Wins = @($wins | ForEach-Object { [int64]$_.H })
+    $windowSig = ($wins.Sig -join ';')
+    if ($windowSig -ne $script:windowSig) { $script:windowSig = $windowSig; [void][W.U]::Changed.Set() }
     $data = ([DateTime]::Now - $script:dataAt).TotalSeconds -ge 3
     if ($data) { $script:dataAt = [DateTime]::Now; $script:res = Get-ResourceItems }  # 计数器只在这里采样，所有浮窗共用
     foreach ($w in $wins) {
         $k = [int64]$w.H
         if (-not $huds[$k]) { $huds[$k] = New-Hud }
         $hud = $huds[$k]; $tabs = $shared.Tabs[$k]
-        if ($w.Moving) { $hud.Shown = $false; $hud.Sig = $null; continue }  # 已被 C# 隐藏
+        if ($w.Moving) { Hide-Hud $hud; $hud.Sig = $null; continue }
         $sig = "$($w.L),$($w.T),$($w.R),$($w.B)|$($tabs.Right),$($tabs.Bottom),$($tabs.Selected)|$($w.H -eq $target.H)|$script:pinned|$($script:show -join ',')"
         if ($data -or $sig -ne $hud.Sig) {
             $hud.Sig = $sig
-            $items = @($(if ($w.H -eq $target.H) { $script:res }) + @(Get-ClaudeItem $tabs) | Where-Object { $_ })
+            $items = @(if ($w.H -eq $target.H) { $script:res }; Get-ClaudeItem $tabs)
             Show-Hud $hud $w $items
         }
+        Sync-Hud $hud $w
     }
     foreach ($k in @($huds.Keys)) { if (-not ($wins | Where-Object { [int64]$_.H -eq $k })) { $huds[$k].Form.Dispose(); $huds.Remove($k); [W.U]::Unwatch([IntPtr]$k) } }  # 窗口已关闭或最小化
-} catch { "$(Get-Date -Format s) $_ $($_.InvocationInfo.PositionMessage)" | Set-Content (Join-Path $env:LOCALAPPDATA 'term-hud\error.log') }  # 定时器里的异常会被 WinForms 吞掉，留下最近一次
-})
+    if ($shared.Error) { throw $shared.Error }
+} catch {
+    $errorDir = Join-Path $env:LOCALAPPDATA 'term-hud'
+    [void](New-Item -ItemType Directory -Force $errorDir)
+    "$(Get-Date -Format s) $_ $($_.InvocationInfo.PositionMessage)" | Set-Content (Join-Path $errorDir 'error.log') -Encoding utf8
+    $shared.Error = $null
+}
+}
+$timer = [Windows.Forms.Timer]@{ Interval = 1000 }
+$timer.add_Tick({ Update-Huds })
 $timer.Start()
 [Windows.Forms.Application]::Run()
 [Environment]::Exit(0)  # 结束后台线程

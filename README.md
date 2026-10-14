@@ -17,6 +17,24 @@ pwsh -NoProfile -File .\term-hud.ps1 -Test    # 自检纯逻辑：温度解析�
 - 左键拖动：移动 WT 窗口（拖动期间 HUD 隐藏，停稳后重新显示）。双击：最大化或还原 WT。
 - 排错：定时器里的最近一次异常写在 `%LOCALAPPDATA%\term-hud\error.log`。已知问题见 spec 的 Known issues。
 
+## 本地 CI
+
+需要 Windows、64 位 PowerShell 7、Git；full 还需要 Windows Terminal 和可交互桌面。
+
+```powershell
+pwsh -NoProfile -File scripts/ci.ps1          # fast：纯逻辑、原生代码编译、回归检查
+pwsh -NoProfile -File scripts/ci.ps1 -Full    # full：再跑真实 WT 的 UI 检查
+git config core.hooksPath .githooks          # 可选：pre-commit 跑 fast，pre-push 跑 full
+```
+
+full 创建名为 `term-hud-ci` 的独立 WT 窗口，使用隔离的设置、会话和模拟额度；不启动 Claude，也不读取登录凭据。测试期间保持该窗口在前台，不操作鼠标或切窗口；结束时关闭测试窗口并恢复鼠标和原前台窗口。覆盖实际拖拽、按住停留、双击、标签切换、缩放、遮挡、最小化、置顶，以及 Clawd、5h、7d 的布局和截图。不要与另一轮 full 同时运行。
+
+2026-10-14 本机实测：fast **33 项 / 2.7 秒**，full **59 项 / 25.9 秒**（其中真实 UI 26 项）；Windows Terminal 1.24.12741.0，3840×2160、225% 缩放。标题栏与 HUD 两种拖拽在松手后分别用 732 ms、1087 ms 恢复。正式进程另行验证了 Clawd 与实际账户的 **5h 28%、7d 25%**，截图见 `build/ci/live-title.png`；CI 模拟数据截图见 `build/ci/ui/claude-initial.png`。跨显示器 DPI 切换尚未做硬件实测。
+
+CI 负责 `build/ci/` 下的日志、截图、隔离数据和 `full-passed` 通过凭证；它们不入库，下一次运行复用并覆盖。full 对运行前后包含未提交文件的 Git tree 做一致性检查，成功后才记录凭证，不改变暂存区。pre-push 检查每个推送提交的内容；与凭证相比仅 Markdown 不同时复用结果，其余改动重新验收。推送内容与当前工作区不一致时会拒绝用工作区的结果代替。
+
+NAS 私有仓库使用远端 `nas`（`nas-git:root/term-hud.git`），`main` 跟踪 `nas/main`。后续发布到 GitHub 时可另加 `origin`。目前执行本地 CI 和 Git hooks，尚未部署远端工作流。
+
 ## 数据源
 
 | 列 | 来源 | 说明 |
