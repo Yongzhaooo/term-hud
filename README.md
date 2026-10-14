@@ -33,7 +33,7 @@ full 创建名为 `term-hud-ci` 的独立 WT 窗口，使用隔离的设置、�
 
 CI 负责 `build/ci/` 下的日志、截图、隔离数据和 `full-passed` 通过凭证；它们不入库，下一次运行复用并覆盖。full 对运行前后包含未提交文件的 Git tree 做一致性检查，成功后才记录凭证，不改变暂存区。pre-push 检查每个推送提交的内容；与凭证相比仅 Markdown 不同时复用结果，其余改动重新验收。推送内容与当前工作区不一致时会拒绝用工作区的结果代替。
 
-NAS 私有仓库使用远端 `nas`（`nas-git:root/term-hud.git`），`main` 跟踪 `nas/main`。后续发布到 GitHub 时可另加 `origin`。目前执行本地 CI 和 Git hooks，尚未部署远端工作流。
+NAS 私有仓库使用远端 `nas`（`nas-git:root/pwsh-hud.git`），`main` 跟踪 `nas/main`。后续发布到 GitHub 时可另加 `origin`。目前执行本地 CI 和 Git hooks，尚未部署远端工作流。
 
 ## 数据源
 
