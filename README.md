@@ -69,8 +69,23 @@ $lnk.Save()
 - Context usage is read from the tail of the session transcripts in `~/.claude/projects/`.
 - LibreHardwareMonitor's web server listens on all interfaces, so other machines on your network can read the sensor data. Add a firewall rule if that matters to you.
 
-### Known issues
+### Performance
 
+Measured on 2026-10-14 over 3 minutes of normal use, sampled once per second (158 s with the HUD shown, 26 s hidden):
+
+| | HUD shown | HUD hidden |
+|---|---|---|
+| CPU, share of one core | 2.5% | 2.4% |
+| CPU, share of the whole machine (24 logical CPUs) | 0.11% | 0.10% |
+| Working set / private memory | 272 MB / 136 MB | 268 MB / 137 MB |
+
+- The `nvidia-smi -lms 3000` child process adds about 32 MB and no measurable CPU.
+- 27 threads. Most of the memory is the PowerShell 7 runtime itself.
+- Test machine: i7-13700K, 64 GB, RTX 5060, PowerShell 7.6.6, Windows Terminal 1.24.12741.0, 3840×2160 at 225%.
+- Why it stays light: resource data is sampled every 3 s; layout is redone only when the window, tabs, settings or data change; tab positions are queried through UI Automation only when the window size, DPI or title changes (with a 10 s fallback), never while dragging; session files are re-read only when their modification time changes.
+- In the full UI test, the HUD reappeared 732 ms after a title-bar drag ended and 1087 ms after a drag started from the HUD.
+
+### Known issues
 - Dragging the terminal window can still feel a bit laggy.
 - Detecting which terminal window to attach to, and where its tabs end, is still not very reliable.
 - Windows only. It depends on Windows Terminal, PowerShell 7, Win32 / UI Automation, Windows performance counters, and optionally LibreHardwareMonitor and `nvidia-smi`. Cross-monitor DPI changes have not been tested on real hardware.
@@ -153,8 +168,23 @@ $lnk.Save()
 - 上下文用量读取自 `~/.claude/projects/` 下会话记录的尾部。
 - LibreHardwareMonitor 的 Web 服务监听所有网卡，同一网络里的其他设备能读到传感器数据。介意的话请自行加防火墙规则。
 
-### 已知问题
+### 性能
 
+2026-10-14 在日常使用中连续采样 3 分钟，每秒一次（HUD 显示 158 秒，隐藏 26 秒）：
+
+| | HUD 显示 | HUD 隐藏 |
+|---|---|---|
+| CPU，占单核 | 2.5% | 2.4% |
+| CPU，占整机（24 个逻辑处理器） | 0.11% | 0.10% |
+| 工作集 / 专用内存 | 272 MB / 136 MB | 268 MB / 137 MB |
+
+- `nvidia-smi -lms 3000` 子进程另占约 32 MB 内存，CPU 占用低到测不出。
+- 共 27 个线程。内存大头是 PowerShell 7 运行时本身。
+- 测试机：i7-13700K、64 GB、RTX 5060、PowerShell 7.6.6、Windows Terminal 1.24.12741.0，3840×2160、225% 缩放。
+- 保持轻量的做法：资源数据每 3 秒采一次；只在窗口、标签、设置或数据变化时重新排版；标签位置只在窗口尺寸、DPI 或标题变化时经 UI Automation 重查（10 秒兜底），拖动中不查；会话文件只在修改时间变化时重读。
+- 完整 UI 测试中，从标题栏拖动结束后 732 ms、从 HUD 上拖动结束后 1087 ms，HUD 重新出现。
+
+### 已知问题
 - 拖动终端窗口时仍有些卡顿。
 - 自动识别该挂在哪个终端窗口、以及标签栏右边界的准确度还不够好。
 - 只支持 Windows：依赖 Windows Terminal、PowerShell 7、Win32 / UI Automation、Windows 性能计数器，可选依赖 LibreHardwareMonitor 和 `nvidia-smi`。跨显示器 DPI 切换还没在真机上测过。
