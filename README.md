@@ -1,5 +1,7 @@
 # term-hud
 
+Development architecture and next validation steps: [docs/architecture.md](docs/architecture.md).
+
 [English](#english) · [中文](#中文)
 
 A tiny resource monitor that lives in the empty space of the Windows Terminal title bar, between the tabs and the window buttons.
